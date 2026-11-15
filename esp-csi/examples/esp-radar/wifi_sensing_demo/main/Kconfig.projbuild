@@ -36,20 +36,4 @@ endchoice
 
 endif
 
-config ESP_WIFI_SENSING_WEB_SERIAL_ENABLE
-    bool "Enable Web Serial monitor output"
-    default y
-    help
-        Stream sensing diagnostics to the host over the standard serial console.
-        The browser Web Serial page can connect to whichever serial port is
-        exposed by the current console configuration.
-
-config ESP_WIFI_SENSING_WEB_SERIAL_STREAM_PERIOD_MS
-    int "Web Serial stream period (ms)"
-    default 50
-    range 20 1000
-    depends on ESP_WIFI_SENSING_WEB_SERIAL_ENABLE
-    help
-        Period used to push one diagnostic snapshot per channel to the Web Serial UI.
-
 endmenu

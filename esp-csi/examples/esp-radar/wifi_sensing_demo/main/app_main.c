@@ -23,8 +23,8 @@
 #include "esp_wifi_sensing.h"
 
 #include "protocol_examples_common.h"
+#include "csi_udp_broadcast.h"
 #include "led_control.h"
-#include "web_serial_monitor.h"
 
 static const char *TAG = "wifi_sensing_demo";
 static esp_wifi_sensing_fsm_handle_t s_hms = NULL;
@@ -179,6 +179,24 @@ static void demo_init(void)
     ESP_ERROR_CHECK(esp_wifi_sensing_fsm_register_event_cb(s_hms, ESP_WIFI_SENSING_FSM_EVENT_INACTIVE, on_motion_event, NULL));
     ESP_ERROR_CHECK(esp_wifi_sensing_fsm_control(s_hms, ESP_WIFI_SENSING_FSM_CTRL_START, NULL));
 
+    csi_udp_peer_t udp_peers[] = {
+        { .name = "AP" },
+        { .name = "MAC_1" },
+        { .name = "MAC_2" },
+    };
+    memcpy(udp_peers[0].mac, s_mac_ap, sizeof(s_mac_ap));
+    memcpy(udp_peers[1].mac, CONFIG_CSI_SEND_MAC, sizeof(udp_peers[1].mac));
+    memcpy(udp_peers[2].mac, CONFIG_CSI_SEND_MAC_2, sizeof(udp_peers[2].mac));
+
+    const csi_udp_broadcast_config_t udp_cfg = {
+        .fsm = s_hms,
+        .peers = udp_peers,
+        .peer_count = sizeof(udp_peers) / sizeof(udp_peers[0]),
+        .broadcast_address = "255.255.255.255",
+        .port = CSI_UDP_BROADCAST_PORT,
+    };
+    ESP_ERROR_CHECK(csi_udp_broadcast_start(&udp_cfg));
+
     ESP_LOGI(TAG,
              "default config: motion_detection_sensitivity=%.3f active_jitter_min=%.3f hold=%" PRIu32 "ms confirm=%d ping=%" PRIu32 "Hz",
              cfg.default_channel_config.sensitivity,
@@ -213,26 +231,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     espnow_rx_init();
     demo_init();
-
-#if CONFIG_ESP_WIFI_SENSING_WEB_SERIAL_ENABLE
-    /* Web UI also maps esp-radar train (TRAIN_START/STOP/REMOVE) and streams wander / train thresholds. */
-    /* Export the same three demo channels to the browser monitor UI. */
-    web_serial_monitor_peer_t serial_peers[] = {
-        { .name = "AP" },
-        { .name = "MAC_1" },
-        { .name = "MAC_2" },
-    };
-    memcpy(serial_peers[0].mac, s_mac_ap, sizeof(s_mac_ap));
-    memcpy(serial_peers[1].mac, CONFIG_CSI_SEND_MAC, sizeof(serial_peers[1].mac));
-    memcpy(serial_peers[2].mac, CONFIG_CSI_SEND_MAC_2, sizeof(serial_peers[2].mac));
-    web_serial_monitor_config_t serial_cfg = {
-        .fsm = s_hms,
-        .peers = serial_peers,
-        .peer_num = sizeof(serial_peers) / sizeof(serial_peers[0]),
-        .stream_period_ms = CONFIG_ESP_WIFI_SENSING_WEB_SERIAL_STREAM_PERIOD_MS,
-    };
-    ESP_ERROR_CHECK(web_serial_monitor_init(&serial_cfg));
-#endif
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

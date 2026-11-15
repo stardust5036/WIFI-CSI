@@ -8,8 +8,13 @@ The example combines:
 - Wi-Fi STA connection and sensing FSM startup
 - Three monitored channels: the connected AP plus two fixed peer MAC addresses
 - A status LED policy for quick visual feedback
-- A lightweight serial protocol that can be consumed by the browser-based Web
-  Serial monitor in `tools/web_serial_monitor.html`
+- UDP broadcast of raw CSI data and firmware sensing results
+
+Each UDP packet uses the `CSIU` magic and version `1`. `type=1` contains the
+raw CSI bytes, source MAC, sequence, data type, and CSI lengths. `type=2`
+contains the firmware motion/presence result and jitter/wander diagnostics.
+Both packet types use UDP port `5005` and the broadcast address
+`255.255.255.255`.
 
 The example follows the same public workflow recommended by the component:
 
@@ -23,8 +28,8 @@ The example follows the same public workflow recommended by the component:
 
 - `main/app_main.c`: example entry point and sensing FSM wiring
 - `main/led_control.*`: LED backend and state mapping
-- `main/web_serial_monitor.*`: line-oriented serial protocol for diagnostics and runtime tuning
-- `tools/web_serial_monitor.html`: browser UI for charts, live diagnostics, and configuration
+- `main/csi_udp_broadcast.*`: raw CSI and firmware-result UDP broadcaster
+- `services/csi_udp_service`: ARMv7 Rust receiver and independent CSI algorithm
 
 ## Build and Run
 
@@ -39,51 +44,11 @@ idf.py flash monitor
 The example uses `protocol_examples_common` for Wi-Fi provisioning, so configure
 your Wi-Fi credentials before flashing if your local workflow requires it.
 
-## Web Serial Monitor
+## ARMv7 receiver
 
-When `CONFIG_ESP_WIFI_SENSING_WEB_SERIAL_ENABLE=y`, the firmware emits
-line-delimited JSON messages prefixed with `HMS:` and accepts commands prefixed
-with `HMSCMD `. This allows ordinary ESP logs and structured diagnostics to
-share the same serial port.
-
-The browser UI currently focuses on the minimum public diagnostics exported by
-the component: `jitter_value`, `smooth_scaled`, `enter_level_scaled`,
-`exit_level_scaled`, `state`, and `init_stage`.
-
-The serial monitor also exposes the main runtime controls used by the demo:
-
-- `HMSCMD HELLO`
-- `HMSCMD START_STREAM`
-- `HMSCMD STOP_STREAM`
-- `HMSCMD FSM_START`
-- `HMSCMD FSM_STOP`
-- `HMSCMD RESET_BASELINE`
-- `HMSCMD GET_CFG ALL`
-- `HMSCMD GET_CFG <peer>`
-- `HMSCMD GET_RUNTIME`
-- `HMSCMD SET_AMPLITUDE_LOG on`
-- `HMSCMD SET_AMPLITUDE_LOG off`
-- `HMSCMD SET_CFG <peer> motion_sensitivity=<float> active_jitter_min=<float> active_filter_ms=<ms>`
-
-Here `<peer>` can be either the demo name (`AP`, `MAC_1`, `MAC_2`) or the peer
-MAC string.
-
-To use the browser monitor:
-
-1. Build and run the firmware.
-2. Open `tools/web_serial_monitor.html` in a Chromium-based browser.
-3. Connect to the board through Web Serial.
-4. Inspect live channel diagnostics or update channel parameters from the page.
-
-If the browser blocks `file://` access for Web Serial, serve the directory
-locally:
-
-```bash
-cd tools
-python3 -m http.server
-```
-
-Then open `http://127.0.0.1:8000/web_serial_monitor.html`.
+Build and run `services/csi_udp_service` on the ARMv7 host. It receives both
+packet types, calculates an independent motion/presence result from each raw
+CSI frame, and prints it beside the most recent firmware result.
 
 ## Demo Behavior
 
@@ -91,6 +56,5 @@ Then open `http://127.0.0.1:8000/web_serial_monitor.html`.
 - The LED blinks while Wi-Fi is disconnected.
 - When the AP channel becomes ACTIVE, the LED turns fully on.
 - When the AP channel returns to INACTIVE, the LED fades out.
-- The two fixed peer channels remain visible in logs and the browser monitor as
-  extra sensing references.
+- The two fixed peer channels remain visible in logs as extra sensing references.
 
