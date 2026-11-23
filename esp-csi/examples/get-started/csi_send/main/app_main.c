@@ -3,134 +3,69 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-/* Get Start Example
 
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 
 #include "nvs_flash.h"
-
-#include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
-#include "esp_now.h"
+#include "esp_event.h"
+#include "lwip/inet.h"
+#include "ping/ping_sock.h"
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL   11
+#define CONFIG_CSI_AP_SSID        "ESP-CSI-AP"
+#define CONFIG_CSI_AP_PASSWORD    ""
+#define CONFIG_SEND_FREQUENCY     100
 
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
-#define CONFIG_WIFI_BAND_MODE   WIFI_BAND_MODE_2G_ONLY
-#define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT40
-#define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT40
-#define CONFIG_WIFI_2G_PROTOCOL             WIFI_PROTOCOL_11N
-#define CONFIG_WIFI_5G_PROTOCOL             WIFI_PROTOCOL_11N
-#else
-#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT40
-#endif
+#define WIFI_CONNECTED_BIT        BIT0
 
-#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT40
-#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
-#define CONFIG_SEND_FREQUENCY               100
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
-#define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
-#endif
-
-static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const char *TAG = "csi_send";
+static EventGroupHandle_t s_wifi_event_group;
 
-static void wifi_init()
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGW(TAG, "Disconnected from CSI AP, reconnecting");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init(void)
 {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-
     ESP_ERROR_CHECK(esp_netif_init());
+    esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-#if CONFIG_IDF_TARGET_ESP32C5
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE);
-    wifi_protocols_t protocols = {
-        .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
-        .ghz_5g = CONFIG_WIFI_5G_PROTOCOL
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_protocols(ESP_IF_WIFI_STA, &protocols));
-    wifi_bandwidths_t bandwidth = {
-        .ghz_2g = CONFIG_WIFI_2G_BANDWIDTHS,
-        .ghz_5g = CONFIG_WIFI_5G_BANDWIDTHS
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidths(ESP_IF_WIFI_STA, &bandwidth));
-#elif (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)) || CONFIG_IDF_TARGET_ESP32C61
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE);
-    wifi_protocols_t protocols = {
-        .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_protocols(ESP_IF_WIFI_STA, &protocols));
-    wifi_bandwidths_t bandwidth = {
-        .ghz_2g = CONFIG_WIFI_2G_BANDWIDTHS,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidths(ESP_IF_WIFI_STA, &bandwidth));
-#else
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, CONFIG_WIFI_BANDWIDTH));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-#endif
-
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-#if CONFIG_IDF_TARGET_ESP32C5
-    if ((CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_2G_ONLY && CONFIG_WIFI_2G_BANDWIDTHS == WIFI_BW_HT20)
-            || (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_5G_ONLY && CONFIG_WIFI_5G_BANDWIDTHS == WIFI_BW_HT20)) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
-    }
-#elif (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)) || CONFIG_IDF_TARGET_ESP32C61
-    if (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_2G_ONLY && CONFIG_WIFI_2G_BANDWIDTHS == WIFI_BW_HT20) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
-    }
-#else
-    if (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT20) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
-    }
-#endif
-    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, CONFIG_CSI_AP_SSID,
+            sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, CONFIG_CSI_AP_PASSWORD,
+            sizeof(wifi_config.sta.password));
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static void wifi_esp_now_init(esp_now_peer_info_t peer)
+void app_main(void)
 {
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
-    esp_now_rate_config_t rate_config = {
-        .phymode = CONFIG_ESP_NOW_PHYMODE,
-        .rate = CONFIG_ESP_NOW_RATE,
-        .ersu = false,
-        .dcm = false
-    };
-    ESP_ERROR_CHECK(esp_now_set_peer_rate_config(peer.peer_addr, &rate_config));
-}
-
-void app_main()
-{
-    /**
-     * @brief Initialize NVS
-     */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -138,33 +73,37 @@ void app_main()
     }
     ESP_ERROR_CHECK(ret);
 
-    /**
-     * @brief Initialize Wi-Fi
-     */
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               wifi_event_handler, NULL));
+
     wifi_init();
 
-    /**
-     * @brief Initialize ESP-NOW
-     *        ESP-NOW protocol see: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/network/esp_now.html
-     */
-    esp_now_peer_info_t peer = {
-        .channel   = CONFIG_LESS_INTERFERENCE_CHANNEL,
-        .ifidx     = WIFI_IF_STA,
-        .encrypt   = false,
-        .peer_addr = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-    };
-    wifi_esp_now_init(peer);
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                        pdFALSE, pdFALSE, portMAX_DELAY);
+
+    esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
+    ping_config.count = 0;
+    ping_config.interval_ms = 1000 / CONFIG_SEND_FREQUENCY;
+    ping_config.task_stack_size = 3072;
+    ping_config.data_size = 1;
+
+    esp_netif_ip_info_t local_ip;
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    ESP_ERROR_CHECK(esp_netif_get_ip_info(sta_netif, &local_ip));
+    ping_config.target_addr.u_addr.ip4.addr = ip4_addr_get_u32(&local_ip.gw);
+    ping_config.target_addr.type = ESP_IPADDR_TYPE_V4;
+
+    esp_ping_handle_t ping_handle = NULL;
+    esp_ping_callbacks_t ping_callbacks = {0};
+    ESP_ERROR_CHECK(esp_ping_new_session(&ping_config, &ping_callbacks, &ping_handle));
+    ESP_ERROR_CHECK(esp_ping_start(ping_handle));
 
     ESP_LOGI(TAG, "================ CSI SEND ================");
-    ESP_LOGI(TAG, "wifi_channel: %d, send_frequency: %d, mac: " MACSTR,
-             CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, MAC2STR(CONFIG_CSI_SEND_MAC));
-
-    for (uint32_t count = 0; ; ++count) {
-        esp_err_t ret = esp_now_send(peer.peer_addr, (const uint8_t *)&count, sizeof(count));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
-        }
-
-        usleep(1000 * 1000 / CONFIG_SEND_FREQUENCY);
-    }
+    ESP_LOGI(TAG, "Connected to CSI AP %s, ping gateway " IPSTR " at %d Hz",
+             CONFIG_CSI_AP_SSID, IP2STR(&local_ip.gw), CONFIG_SEND_FREQUENCY);
 }

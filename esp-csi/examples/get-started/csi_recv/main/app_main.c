@@ -15,6 +15,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 
 #include "nvs_flash.h"
 
@@ -23,22 +27,15 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
-#include "esp_now.h"
 #include "esp_csi_gain_ctrl.h"
+#include "esp_event.h"
+#include "esp_timer.h"
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL   11
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
-#define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
-#define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT40
-#define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT40
-#define CONFIG_WIFI_2G_PROTOCOL             WIFI_PROTOCOL_11N
-#define CONFIG_WIFI_5G_PROTOCOL             WIFI_PROTOCOL_11N
-#else
-#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT40
-#endif
-
-#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT40
-#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
+#define CONFIG_AP_SSID                     "ESP-CSI-AP"
+#define CONFIG_AP_PASSWORD                 ""
+#define CONFIG_CSI_AP_MAX_CONNECTION       4
 #define CONFIG_FORCE_GAIN                   0
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
@@ -53,85 +50,163 @@
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
 
-static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const char *TAG = "csi_recv";
+
+#define WIFI_CONNECTED_BIT BIT0
+static EventGroupHandle_t s_wifi_event_group;
+static uint8_t s_send_sta_mac[6];
+static int s_udp_socket = -1;
+static struct sockaddr_in s_udp_destination;
+static uint32_t s_udp_sequence = 0;
+
+typedef struct __attribute__((packed)) {
+    char magic[4];
+    uint8_t version;
+    uint8_t type;
+    uint16_t header_len;
+    uint16_t payload_len;
+    uint16_t reserved;
+    uint32_t sequence;
+    uint32_t timestamp_us;
+    uint8_t source_mac[6];
+    uint8_t data_type;
+    uint8_t motion_active;
+    uint8_t presence_active;
+    uint8_t reserved_flags;
+    float jitter;
+    float wander;
+    uint16_t raw_len;
+    uint16_t valid_len;
+} csi_udp_header_t;
 
 static void wifi_init()
 {
+    if (strlen(CONFIG_CSI_PUBLIC_WIFI_SSID) == 0) {
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
+
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-#if CONFIG_IDF_TARGET_ESP32C5
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE);
-    wifi_protocols_t protocols = {
-        .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
-        .ghz_5g = CONFIG_WIFI_5G_PROTOCOL
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_protocols(ESP_IF_WIFI_STA, &protocols));
-    wifi_bandwidths_t bandwidth = {
-        .ghz_2g = CONFIG_WIFI_2G_BANDWIDTHS,
-        .ghz_5g = CONFIG_WIFI_5G_BANDWIDTHS
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidths(ESP_IF_WIFI_STA, &bandwidth));
-#elif (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)) || CONFIG_IDF_TARGET_ESP32C61
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE);
-    wifi_protocols_t protocols = {
-        .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_protocols(ESP_IF_WIFI_STA, &protocols));
-    wifi_bandwidths_t bandwidth = {
-        .ghz_2g = CONFIG_WIFI_2G_BANDWIDTHS,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidths(ESP_IF_WIFI_STA, &bandwidth));
-#else
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, CONFIG_WIFI_BANDWIDTH));
-    ESP_ERROR_CHECK(esp_wifi_start());
-#endif
-
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-#if CONFIG_IDF_TARGET_ESP32C5
-    if ((CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_2G_ONLY && CONFIG_WIFI_2G_BANDWIDTHS == WIFI_BW_HT20)
-            || (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_5G_ONLY && CONFIG_WIFI_5G_BANDWIDTHS == WIFI_BW_HT20)) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
-    }
-#elif (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)) || CONFIG_IDF_TARGET_ESP32C61
-    if (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_2G_ONLY && CONFIG_WIFI_2G_BANDWIDTHS == WIFI_BW_HT20) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
-    }
-#else
-    if (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT20) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
-    }
-#endif
 
-    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = CONFIG_AP_SSID,
+            .ssid_len = sizeof(CONFIG_AP_SSID) - 1,
+            .password = CONFIG_AP_PASSWORD,
+            .channel = CONFIG_CSI_AP_CHANNEL,
+            .authmode = WIFI_AUTH_OPEN,
+            .max_connection = CONFIG_CSI_AP_MAX_CONNECTION,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+    wifi_config_t sta_config = {0};
+    strlcpy((char *)sta_config.sta.ssid, CONFIG_CSI_PUBLIC_WIFI_SSID,
+            sizeof(sta_config.sta.ssid));
+    strlcpy((char *)sta_config.sta.password, CONFIG_CSI_PUBLIC_WIFI_PASSWORD,
+            sizeof(sta_config.sta.password));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static void wifi_esp_now_init(esp_now_peer_info_t peer)
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
 {
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
-    esp_now_rate_config_t rate_config = {
-        .phymode = CONFIG_ESP_NOW_PHYMODE,
-        .rate = CONFIG_ESP_NOW_RATE,//  WIFI_PHY_RATE_MCS0_LGI,
-        .ersu = false,
-        .dcm = false
-    };
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
-    ESP_ERROR_CHECK(esp_now_set_peer_rate_config(peer.peer_addr, &rate_config));
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+        memcpy(s_send_sta_mac, event->mac, sizeof(s_send_sta_mac));
+        ESP_LOGI(TAG, "CSI sender connected: " MACSTR, MAC2STR(s_send_sta_mac));
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
 
+static esp_err_t csi_udp_init(void)
+{
+    s_udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s_udp_socket < 0) {
+        return ESP_FAIL;
+    }
+
+    if (strcmp(CONFIG_CSI_UDP_TARGET_IP, "255.255.255.255") == 0) {
+        int broadcast = 1;
+        if (setsockopt(s_udp_socket, SOL_SOCKET, SO_BROADCAST,
+                       &broadcast, sizeof(broadcast)) != 0) {
+            close(s_udp_socket);
+            s_udp_socket = -1;
+            return ESP_FAIL;
+        }
+        s_udp_destination.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        ESP_LOGI(TAG, "UDP CSI broadcast started on public Wi-Fi: 255.255.255.255:%d",
+                 CONFIG_CSI_UDP_PORT);
+    } else {
+        struct in_addr target_addr;
+        if (inet_pton(AF_INET, CONFIG_CSI_UDP_TARGET_IP, &target_addr) != 1) {
+            close(s_udp_socket);
+            s_udp_socket = -1;
+            ESP_LOGE(TAG, "Invalid UDP target IP: %s", CONFIG_CSI_UDP_TARGET_IP);
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_udp_destination.sin_addr = target_addr;
+        ESP_LOGI(TAG, "UDP CSI unicast started on public Wi-Fi: %s:%d",
+                 CONFIG_CSI_UDP_TARGET_IP, CONFIG_CSI_UDP_PORT);
+    }
+
+    s_udp_destination.sin_family = AF_INET;
+    s_udp_destination.sin_port = htons(CONFIG_CSI_UDP_PORT);
+    return ESP_OK;
+}
+
+static void csi_udp_broadcast_raw(const wifi_csi_info_t *info)
+{
+    if (s_udp_socket < 0 || !info || !info->buf || info->len <= 0) {
+        return;
+    }
+
+    uint16_t raw_len = info->len;
+    uint16_t payload_len = raw_len > 2048 ? 2048 : raw_len;
+
+    uint8_t packet[sizeof(csi_udp_header_t) + 2048];
+    csi_udp_header_t *header = (csi_udp_header_t *)packet;
+    memset(header, 0, sizeof(*header));
+    memcpy(header->magic, "CSIU", 4);
+    header->version = 1;
+    header->type = 1;
+    header->header_len = sizeof(*header);
+    header->payload_len = payload_len;
+    header->sequence = s_udp_sequence++;
+    header->timestamp_us = info->rx_ctrl.timestamp;
+    memcpy(header->source_mac, s_send_sta_mac, sizeof(header->source_mac));
+#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+    header->data_type = 1;
+#else
+    header->data_type = 0;
+#endif
+    header->raw_len = raw_len;
+    header->valid_len = payload_len;
+    memcpy(packet + sizeof(*header), info->buf, payload_len);
+
+    int sent = sendto(s_udp_socket, packet, sizeof(*header) + payload_len, 0,
+                      (const struct sockaddr *)&s_udp_destination,
+                      sizeof(s_udp_destination));
+    if (sent < 0) {
+        ESP_LOGW(TAG, "UDP CSI send failed: errno=%d", errno);
+    }
 }
 
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
@@ -141,7 +216,12 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
-    if (memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6)) {
+    if (s_send_sta_mac[0] == 0 && s_send_sta_mac[1] == 0 &&
+        s_send_sta_mac[2] == 0 && s_send_sta_mac[3] == 0 &&
+        s_send_sta_mac[4] == 0 && s_send_sta_mac[5] == 0) {
+        return;
+    }
+    if (memcmp(info->mac, s_send_sta_mac, 6)) {
         return;
     }
 
@@ -167,7 +247,8 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     ESP_LOGI(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
 #endif
 
-    uint32_t rx_id = *(uint32_t *)(info->payload + 15);
+    csi_udp_broadcast_raw(info);
+    uint32_t rx_id = s_count;
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV ================");
@@ -217,7 +298,7 @@ static void wifi_csi_init()
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
     wifi_csi_config_t csi_config = {
         .enable                   = true,
-        .acquire_csi_legacy       = false,
+        .acquire_csi_legacy       = true,
         .acquire_csi_force_lltf   = CSI_FORCE_LLTF,
         .acquire_csi_ht20         = true,
         .acquire_csi_ht40         = true,
@@ -234,7 +315,7 @@ static void wifi_csi_init()
 #elif CONFIG_IDF_TARGET_ESP32C6
     wifi_csi_config_t csi_config = {
         .enable                 = true,
-        .acquire_csi_legacy     = false,
+        .acquire_csi_legacy     = true,
         .acquire_csi_ht20       = true,
         .acquire_csi_ht40       = true,
         .acquire_csi_su         = true,
@@ -274,24 +355,25 @@ void app_main()
     }
     ESP_ERROR_CHECK(ret);
 
-    /**
-     * @brief Initialize Wi-Fi
-     */
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               wifi_event_handler, NULL));
+
     wifi_init();
 
-    /**
-     * @brief Initialize ESP-NOW
-     *        ESP-NOW protocol see: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/network/esp_now.html
-     */
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                        pdFALSE, pdFALSE, portMAX_DELAY);
 
-    esp_now_peer_info_t peer = {
-        .channel   = CONFIG_LESS_INTERFERENCE_CHANNEL,
-        .ifidx     = WIFI_IF_STA,
-        .encrypt   = false,
-        .peer_addr = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-    };
+    ESP_LOGI(TAG, "connected to public Wi-Fi SSID: %s",
+             CONFIG_CSI_PUBLIC_WIFI_SSID);
+    ESP_LOGI(TAG, "CSI SoftAP SSID: %s", CONFIG_AP_SSID);
 
-    wifi_esp_now_init(peer);
-
+    ESP_ERROR_CHECK(csi_udp_init());
     wifi_csi_init();
 }
